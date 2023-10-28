@@ -14,8 +14,42 @@ message Client {
   int64 clientId = 1;
   int64 timestamp = 2;
 }
+
+message StreamRequest {
+    int64 timestamp = 1;
+    string message = 2;
+    int64 clientId = 3;
+}
+
+message StreamResponse {
+    int64 timestamp = 1;
+
+    oneof Event {
+        Join    client_join    = 2;
+        Leave   client_leave   = 3;
+        Message  client_message  = 4;
+        Shutdown server_shutdown = 5;
+    }
+
+    message Join {
+        int64 clientId = 1;
+    }
+
+    message Leave {
+        int64 clientId = 1;
+    }
+
+    message Message {
+        int64 clientId = 1;
+        string message = 2;
+    }
+
+    message Shutdown {}
+}
+
+
 service ChatService {
   rpc Leave(Client) returns (Client);
   rpc Join(Client) returns (Client);
-  rpc Publish(Message) returns (google.protobuf.Empty);
+  rpc Stream(stream StreamRequest) returns (stream StreamResponse);
 }

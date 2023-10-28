@@ -12,3 +12,21 @@ go run client/client.go -cId 2 -cPort 5455
 
 rpc PublishMessage(Message) returns (Message);
   rpc BroadcastMessage(Message) returns (Message);
+
+
+
+## Join
+
+timestamp	event
+
+0	client initialize
+
+1	client join
+
+2	server receive "client join"
+
+3	server broadcast "Participant 1 joined Chitty-Chat at Lamport time 2"
+
+4	client 2 received broadcasted message
+
+## Leave

@@ -24,6 +24,7 @@ const _ = grpc.SupportPackageIsVersion7
 type ChatServiceClient interface {
 	Leave(ctx context.Context, in *Client, opts ...grpc.CallOption) (*Client, error)
 	Join(ctx context.Context, in *Client, opts ...grpc.CallOption) (*Client, error)
+	Stream(ctx context.Context, opts ...grpc.CallOption) (ChatService_StreamClient, error)
 }
 
 type chatServiceClient struct {
@@ -52,12 +53,44 @@ func (c *chatServiceClient) Join(ctx context.Context, in *Client, opts ...grpc.C
 	return out, nil
 }
 
+func (c *chatServiceClient) Stream(ctx context.Context, opts ...grpc.CallOption) (ChatService_StreamClient, error) {
+	stream, err := c.cc.NewStream(ctx, &ChatService_ServiceDesc.Streams[0], "/handin3.ChatService/Stream", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &chatServiceStreamClient{stream}
+	return x, nil
+}
+
+type ChatService_StreamClient interface {
+	Send(*StreamRequest) error
+	Recv() (*StreamResponse, error)
+	grpc.ClientStream
+}
+
+type chatServiceStreamClient struct {
+	grpc.ClientStream
+}
+
+func (x *chatServiceStreamClient) Send(m *StreamRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *chatServiceStreamClient) Recv() (*StreamResponse, error) {
+	m := new(StreamResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // ChatServiceServer is the server API for ChatService service.
 // All implementations must embed UnimplementedChatServiceServer
 // for forward compatibility
 type ChatServiceServer interface {
 	Leave(context.Context, *Client) (*Client, error)
 	Join(context.Context, *Client) (*Client, error)
+	Stream(ChatService_StreamServer) error
 	mustEmbedUnimplementedChatServiceServer()
 }
 
@@ -70,6 +103,9 @@ func (UnimplementedChatServiceServer) Leave(context.Context, *Client) (*Client, 
 }
 func (UnimplementedChatServiceServer) Join(context.Context, *Client) (*Client, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Join not implemented")
+}
+func (UnimplementedChatServiceServer) Stream(ChatService_StreamServer) error {
+	return status.Errorf(codes.Unimplemented, "method Stream not implemented")
 }
 func (UnimplementedChatServiceServer) mustEmbedUnimplementedChatServiceServer() {}
 
@@ -120,6 +156,32 @@ func _ChatService_Join_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ChatService_Stream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ChatServiceServer).Stream(&chatServiceStreamServer{stream})
+}
+
+type ChatService_StreamServer interface {
+	Send(*StreamResponse) error
+	Recv() (*StreamRequest, error)
+	grpc.ServerStream
+}
+
+type chatServiceStreamServer struct {
+	grpc.ServerStream
+}
+
+func (x *chatServiceStreamServer) Send(m *StreamResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *chatServiceStreamServer) Recv() (*StreamRequest, error) {
+	m := new(StreamRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // ChatService_ServiceDesc is the grpc.ServiceDesc for ChatService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -136,6 +198,13 @@ var ChatService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ChatService_Join_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Stream",
+			Handler:       _ChatService_Stream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "grpc/proto.proto",
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	proto "handin3/grpc" // Adjust the import path
+	"io"
 	"log"
 	"net"
 	"strconv"
@@ -11,6 +12,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type Server struct {
@@ -18,11 +21,14 @@ type Server struct {
 	mu                                   sync.Mutex
 	messages                             []*proto.Message
 	clients                              map[int64]int64
+	ClientStreams                        map[int64]chan *proto.StreamResponse
+	Broadcast                            chan *proto.StreamResponse
+	streamsMtx                           sync.RWMutex
 	lastID                               int64
 	port                                 int
 }
 
-var port = flag.Int("port", 8080, "The server port")
+var port = flag.Int("port", 5455, "The server port")
 
 func (s *Server) Join(ctx context.Context, req *proto.Client) (*proto.Client, error) {
 
@@ -38,6 +44,13 @@ func (s *Server) Join(ctx context.Context, req *proto.Client) (*proto.Client, er
 	// Add the client to the map
 	s.clients[req.ClientId] = req.Timestamp
 	log.Printf("Participant %d joined Chitty-Chat at Lamport time %d", req.ClientId, req.Timestamp)
+
+	s.Broadcast <- &proto.StreamResponse{
+		Timestamp: req.Timestamp,
+		Event: &proto.StreamResponse_ClientJoin{ClientJoin: &proto.StreamResponse_Join{
+			ClientId: req.ClientId,
+		}},
+	}
 
 	return req, nil
 }
@@ -60,6 +73,12 @@ func (s *Server) Leave(ctx context.Context, req *proto.Client) (*proto.Client, e
 	delete(s.clients, req.ClientId)
 
 	log.Printf("Participant %d left Chitty-Chat at Lamport time %d", req.ClientId, req.Timestamp)
+	s.Broadcast <- &proto.StreamResponse{
+		Timestamp: req.Timestamp,
+		Event: &proto.StreamResponse_ClientLeave{ClientLeave: &proto.StreamResponse_Leave{
+			ClientId: req.ClientId,
+		}},
+	}
 	return req, nil
 }
 
@@ -67,19 +86,19 @@ func main() {
 	flag.Parse()
 
 	server := &Server{
-		clients: make(map[int64]int64),
-		port:    *port,
-		lastID:  0,
-	}
-	go startServer(server)
+		clients:   make(map[int64]int64),
+		port:      *port,
+		lastID:    0,
+		Broadcast: make(chan *proto.StreamResponse, 1000),
 
-	// Keep the server running until it is manually quit
-	for {
-
+		ClientStreams: make(map[int64]chan *proto.StreamResponse),
 	}
+	startServer(server)
+
 }
 
 func startServer(server *Server) {
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create a new grpc server
 	grpcServer := grpc.NewServer()
@@ -98,6 +117,140 @@ func startServer(server *Server) {
 	if serveError != nil {
 		log.Fatalf("Could not serve listener")
 	}
+	go server.broadcast(ctx)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+		cancel()
+	}()
+
+	<-ctx.Done()
+}
+func (s *Server) broadcast(_ context.Context) {
+	for res := range s.Broadcast {
+		s.streamsMtx.RLock()
+		for _, stream := range s.ClientStreams {
+			select {
+			case stream <- res:
+				// noop
+			default:
+				log.Println("client stream full, dropping message")
+			}
+		}
+		s.streamsMtx.RUnlock()
+	}
+}
+
+// the server can send broadcasted messages to the client through this connection
+// client establishes a server-side streaming connection with the server, and it expects to receive a stream of messages from the server.
+func (s *Server) Stream(srv proto.ChatService_StreamServer) error {
+	clientID, ok := s.extractClientID(srv.Context())
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing client ID")
+	}
+
+	// Check if the clientID is stored in the server's map of connected clients.
+	if _, found := s.clients[clientID]; !found {
+		return status.Error(codes.PermissionDenied, "client is not authorized to stream")
+	}
+
+	go s.sendBroadcasts(srv, clientID)
+
+	for {
+		req, err := srv.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		// set maximum of local and event timestamps to be the current timestamp
+		clientTimestamp := req.GetTimestamp()
+		if clientTimestamp > s.lastID {
+			s.lastID = clientTimestamp
+		}
+		s.lastID++
+
+		s.Broadcast <- &proto.StreamResponse{
+			Timestamp: s.lastID,
+			Event: &proto.StreamResponse_ClientMessage{ClientMessage: &proto.StreamResponse_Message{
+				ClientId: clientID,
+				Message:  req.Message,
+			}},
+		}
+	}
+
+	<-srv.Context().Done()
+	return srv.Context().Err()
+}
+
+func (s *Server) openStream(clientId int64) (stream chan *proto.StreamResponse) {
+	stream = make(chan *proto.StreamResponse, 100)
+
+	s.streamsMtx.Lock()
+	s.ClientStreams[clientId] = stream
+	s.streamsMtx.Unlock()
+
+	log.Printf("opened stream for client %d", clientId)
+
+	return
+}
+
+func (s *Server) closeStream(clientId int64) {
+	s.streamsMtx.Lock()
+	if stream, ok := s.ClientStreams[clientId]; ok {
+		delete(s.ClientStreams, clientId)
+		close(stream)
+	}
+
+	log.Printf("closed stream for client %d", clientId)
+
+	s.streamsMtx.Unlock()
+}
+
+func (s *Server) sendBroadcasts(srv proto.ChatService_StreamServer, clientId int64) {
+	stream := s.openStream(clientId)
+	defer s.closeStream(clientId)
+
+	for {
+		select {
+		case <-srv.Context().Done():
+			return
+		case res := <-stream:
+			if s, ok := status.FromError(srv.Send(res)); ok {
+				switch s.Code() {
+				case codes.OK:
+					// noop
+				case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
+					log.Fatalf("client (%d) terminated connection", clientId)
+					return
+				default:
+					log.Fatalf("failed to send to client (%d): %v", clientId, s.Err())
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) extractClientID(ctx context.Context) (int64, bool) {
+	// Extract metadata from the context
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		log.Fatalf("missing metadata from context")
+		return 0, false
+	}
+
+	// Check if the "clientID" key exists in the metadata
+	if values, found := md["clientid"]; found && len(values) > 0 {
+		// Try to parse the "clientID" value as an int64
+		if clientID, err := strconv.ParseInt(values[0], 10, 64); err == nil {
+			return clientID, true
+
+		}
+	}
+
+	return 0, false
 }
 
 // func (s *chatServer) PublishMessage(ctx context.Context, req *proto.Message) (*proto.Message, error) {
